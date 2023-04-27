@@ -1,0 +1,58 @@
+---
+title: "MPA Exposure Analysis"
+format: 
+  html:
+    code-fold: true
+editor: visual
+---
+
+Code to characterize exposure of California MPAs to future pH, DO, and temperature.
+
+## Setup
+
+load libraries + read data
+
+```{r}
+#| label: libraries
+#| message: false
+
+library(tidyverse)
+library(lubridate)
+library(data.table)
+library(factoextra)
+library(broom)
+library(cowplot)
+library(respR)
+library(here)
+
+```
+
+```{r}
+#| label: load_data
+
+mpa <- read_csv(here("data/processeddata/GFDLmpa.csv")) %>% 
+  mutate(DO_mmolL = DO_surf/1000,
+         DO_mgL = convert_DO(DO_mmolL, from = "mmol/L", to = "mg/L")) %>%
+  filter(Year >= 2090)
+
+```
+
+## Create summary stats
+
+Find mean and lower 10th percentile of pH, temp, and DO for each MPA
+
+```{r}
+#| label: summary_stats
+mpa_sum <- mpa %>% 
+  group_by(File) %>% 
+  summarize(across(c(T_surf, DO_mgL, pH_surf), 
+                   list(mean = mean, quantile = ~ quantile(.x, 0.1, na.rm = TRUE)))) %>% 
+  rename(T_mean = T_surf_mean, 
+         DO_mean = DO_mgL_mean, 
+         pH_mean = pH_surf_mean, 
+         T_low10 = T_surf_quantile, 
+         DO_low10 = DO_mgL_quantile, 
+         pH_low10 = pH_surf_quantile)
+
+knitr::kable(mpa_sum)
+```
