@@ -25,6 +25,7 @@ library(cowplot)
 library(respR)
 library(here)
 library(lattice)
+library(RcppRoll)
 
 ```
 
@@ -32,7 +33,7 @@ library(lattice)
 #| label: load_data
 #| message: false
 
-#Read mpa data, convert DO units, filter for years 2090-2100
+  #Read mpa data, convert DO units, filter for years 2090-2100
 mpa <- read_csv(here("data/processeddata/GFDLmpa.csv")) %>% 
   mutate(DO_mmolL = DO_surf/1000,
          DO_mgL = convert_DO(DO_mmolL, from = "mmol/L", to = "mg/L")) %>%
@@ -384,7 +385,7 @@ hypoxic_nonup <- mpa_nonup %>%
   summarize(hypo_days = sum(DO_mgL < 4.6, na.rm = TRUE), 
             numdays = sum(DO_mgL > 0, na.rm = TRUE)) %>%
   mutate(prcnt_hypo = (hypo_days/numdays)*100)
-
+a
 
 #adding prcnt unsat and hypoxic to summary stats - export this into qgis to make maps
 xtremesum <- merge(mpa_sum, unsat,  by = "File")
@@ -399,4 +400,31 @@ xtremesum_nonup <- merge(xtremesum_nonup, hypoxic_nonup,  by = "File")
 write.csv(xtremesum, file = "IPSLxtremesum.csv")
 write.csv(xtremesum_up, file = "IPSLxtremesum_up.csv")
 write.csv(xtremesum_nonup, file = "IPSLxtremesum_nonup.csv")
+```
+
+## Anomalous temp analysis
+
+Take climatolaogical average for everyday and climatological SD in a sliding 30 day window to figure out temperaatauare aaadeaviaationsaaaaaaaaaaaaaaaaaaaaaa
+
+```{r}
+#| label: temp_anom
+T_climtology <- mpa %>% #column, size of window. for first nd last, over aaaaaaaaaaaaaa1a9a aaayrs inted of 20
+  mutate(sliding_temp_sd = roll_sd(T_surf, 30, fill = NA)) %>% 
+  group_by(File, julianday) %>%
+  summarise(T_clim_mean = mean(T_surf, na.rm = TRUE),
+            T_clim_sd = mean(sliding_temp_sd, na.rm = TRUE),
+            .groups = "drop")
+
+T_clim_1mpa <- T_climtology %>% 
+  filter(File == File[1])
+ggplot(T_clim_1mpa, aes(julianday)) +
+  geom_ribbon(aes(ymin = T_clim_mean - 2 * T_clim_sd,
+                  ymax = T_clim_mean - 2 * T_clim_sd),
+              fill = "black", alpha = 0.5) +
+  geom_line(aes(y = T_clim_mean), size = 1, color = "blue") +
+  labs(title = T_clim_1mpa$File[1]) +
+  theme_classic()
+aaa
+aaaaaaa
+aaaaaaaaaaaaaaaaaaaaaaaaaa
 ```
