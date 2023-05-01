@@ -6,11 +6,11 @@ format:
 editor: visual
 ---
 
-Code to characterize exposure of California MPAs to future pH, DO, and temperature.
+Code to characterize exposure of California MPAs to future pH, DO, and temperature using GFDL model predictions.
 
 ## Setup
 
-load libraries + read data
+Load libraries and read data. Convert DO units and filter for years 2090-2100.
 
 ```{r}
 #| label: libraries
@@ -24,12 +24,15 @@ library(broom)
 library(cowplot)
 library(respR)
 library(here)
+library(lattice)
 
 ```
 
 ```{r}
 #| label: load_data
+#| message: false
 
+#Read mpa data, convert DO units, filter for years 2090-2100
 mpa <- read_csv(here("data/processeddata/GFDLmpa.csv")) %>% 
   mutate(DO_mmolL = DO_surf/1000,
          DO_mgL = convert_DO(DO_mmolL, from = "mmol/L", to = "mg/L")) %>%
@@ -43,6 +46,7 @@ Find mean and lower 10th percentile of pH, temp, and DO for each MPA
 
 ```{r}
 #| label: summary_stats
+
 mpa_sum <- mpa %>% 
   group_by(File) %>% 
   summarize(across(c(T_surf, DO_mgL, pH_surf), 
@@ -53,6 +57,346 @@ mpa_sum <- mpa %>%
          T_low10 = T_surf_quantile, 
          DO_low10 = DO_mgL_quantile, 
          pH_low10 = pH_surf_quantile)
+```
 
-knitr::kable(mpa_sum)
+## Add MPA names and regions
+
+Merge MPA centroids (has coords and names of MPAs) to the summary stats file and MPA file. Add regions.
+
+```{r}
+#| label: centroids_regions
+
+mpa_centroids<- read.csv("~/Documents/Packard_MPA_Project/Data/MPA_data/MPA_polygons.csv")
+mpa_centroids$File <- sub("^", "tphdo_mpa_", mpa_centroids$OBJECTID )
+mpa_sum$File <- substr(mpa_sum$File, 1, nchar(mpa_sum$File)-4)
+mpa$File <- substr(mpa$File, 1, nchar(mpa$File)-4)
+mpa_sum <- merge(mpa_sum, mpa_centroids,  by = "File")
+mpa <- merge(mpa, mpa_centroids,  by = "File")
+
+mpa_sum <- mpa_sum %>%
+  mutate(region = ifelse(degy >= 37.29, "norca", 
+                         ifelse(degy > 34.8, "centralca", 
+                                ifelse("degy" < 34.274 & "degx" < -119.220, "channelisl" , "socal")))) 
+
+mpa <- mpa %>%
+  mutate(region = ifelse(degy >= 37.29, "norca", 
+                         ifelse(degy > 34.8, "centralca", 
+                                ifelse("degy" < 34.274 & "degx" < -119.220, "channelisl" , 
+                                       "socal")))) 
+
+channel <- c("Anacapa Island FMCA", "Anacapa Island FMR", "Anacapa Island SMCA", "Anacapa Island SMR", "Anacapa Island Special Closure", 
+             "Arrow Point to Lion Head Point SMCA", "Begg Rock SMR", "Blue Cavern Offshore SMCA", "Blue Cavern Onshore SMCA (No-Take)", 
+             "Carrington Point SMR", "Casino Point SMCA (No-Take)", "Cat Harbor SMCA", "Farnsworth Offshore SMCA", "Farnsworth Onshore SMCA", 
+             "Footprint FMR", "Footprint SMR", "Gull Island FMR", "Gull Island SMR", "Harris Point FMR", "Harris Point SMR", "Judith Rock SMR", 
+             "Long Point SMR", "Lover’s Cove SMCA", "Painted Cave SMCA", "Richardson Rock FMR", "Richardson Rock SMR", "San Miguel Island Special Closure", 
+             "Santa Barbara Island FMR", "Santa Barbara Island SMR", "Scorpion FMR", "Scorpion SMR", "Skunk Point SMR", "South Point FMR", "South Point SMR")
+
+mpa_sum$region[mpa_sum$NAME %in% channel]  <- "channel"    
+mpa$region[mpa$NAME %in% channel]  <- "channel"               
+mpa_centroids$region[mpa_centroids$NAME %in% channel]  <- "channel" 
+```
+
+## Calculate seasonal variation
+
+Create a climatology (Jan averaged over every year), so each MPA has one value per month that is averaged over all of the years. Find SD of this dataframe, to get seasonal variation.
+
+```{r}
+#| label: clim_SD
+
+mpa_climatology <- mpa %>%
+  group_by(File, Month) %>%
+  summarise(T_clim = mean(T_surf), pH_clim = mean(pH_surf), DO_clim = mean(DO_surf))
+
+seasonalSD <- mpa_climatology %>%
+  group_by(File) %>%
+  summarise(T_seasonalSD = sd(T_clim),
+            pH_seasonalSD = sd(pH_clim),
+            DO_seasonalSD = sd(DO_clim))
+```
+
+## Calculate event-based variation
+
+Create a mock dataset interpolating climatologies to get daily values in the absence of natural event-based variability. Subtract actual daily values. Find standard deviation of these differences (on a daily scale).
+
+Setup for interpolation:
+
+```{r}
+#| label: inter_setup
+#| message: false
+
+#First: Need to create a day1 and day365 proxies. Approx function can only interpolate not extrapolate so without this, you can interpolate days 1-14 and 350-365. #below creates empty vectors as big as we need (365 days per mpa) for each variable and each mpa. julianday is dates 1-365 as many mpa times
+
+mpaslist = unique(mpa$File) 
+mpas = rep(NA, 365*121)
+julianday = rep(1:365, 121)
+T_clim = rep(NA, 365*121)
+pH_clim = rep(NA, 365*121)
+DO_clim = rep(NA, 365*121)
+
+#Set up a vector of julian day assignment for the 15th of each month and the first and last day of the year
+x_in <- yday(as.Date(c("2000-01-01", "2000-01-15","2000-02-15","2000-03-15","2000-04-15","2000-05-15","2000-06-15",
+                       "2000-07-15","2000-08-15","2000-09-15","2000-10-15","2000-11-15","2000-12-15", "2000-12-31")))
+
+# creating a list of all the days of the year not included in x_in to interpolate to.
+x_out <- (1:365)
+x_out <- x_out[!(x_out %in% x_in)] #removing the days of the year we already have values for
+```
+
+Interpolation for temp:
+
+```{r}
+#| label: inter_temp
+#| message: false
+
+for (i in 1:length(mpaslist)){
+  print(i)
+  d = mpa_climatology %>% filter(File == mpaslist[i]) %>% select(T_clim)
+  #use a weighted average to get these
+  Dec31 = as.numeric(( ((16/30) * (d[12,2])) + ((14/30) * d[1,2]) ))
+  Jan1 = as.numeric(( ((14/30) * (d[12,2])) + ((16/30) * d[1,2]) ))
+  # a list of y-values of the climatological temp on each of the days in x_in
+  y_in <- c(Jan1, d$T_clim, Dec31)
+
+  mod = approx(x = x_in, y = y_in, xout = x_out) 
+  mpas[((i-1)*365+1):(i*365)] <- mpaslist[i] #rep(mpaslist[1], 365)
+  T_clim[((i-1)*365+1):(i*365)] <- mod$y
+}
+
+tempdata = data.frame(mpas, julianday,T_clim)
+tempdata <- tempdata %>%
+  rename(File = mpas)
+
+#Later we create a julian day variable in our OG mpa dataset, to merge this to all the rows on the dataset by filename and day and then have the mean daily climatological value for each row. 
+```
+
+Interpolation for pH
+
+```{r}
+#| label: inter_pH
+#| message: false
+
+for (i in 1:length(mpaslist)){
+  print(i)
+  d = mpa_climatology %>% filter(File == mpaslist[i]) %>% select(pH_clim)
+  Dec31 = as.numeric(( ((16/30) * (d[12,2])) + ((14/30) * d[1,2]) ))
+  Jan1 = as.numeric(( ((14/30) * (d[12,2])) + ((16/30) * d[1,2]) ))
+
+  y_in <- c(Jan1, d$pH_clim, Dec31)
+
+  mod = approx(x = x_in, y = y_in, xout = x_out) 
+  mpas[((i-1)*365+1):(i*365)] <- mpaslist[i]
+  pH_clim[((i-1)*365+1):(i*365)] <- mod$y
+}
+
+pHdata = data.frame(mpas, julianday,pH_clim)
+pHdata <- pHdata %>%
+  rename(File = mpas)
+```
+
+Interpolation for DO:
+
+```{r}
+#| label: inter_DO
+#| message: false
+
+for (i in 1:length(mpaslist)){
+  print(i)
+  d = mpa_climatology %>% filter(File == mpaslist[i]) %>% select(DO_clim)
+  Dec31 = as.numeric(( ((16/30) * (d[12,2])) + ((14/30) * d[1,2]) ))
+  Jan1 = as.numeric(( ((14/30) * (d[12,2])) + ((16/30) * d[1,2]) ))
+  y_in <- c(Jan1, d$DO_clim, Dec31)
+  
+  mod = approx(x = x_in, y = y_in, xout = x_out) 
+  mpas[((i-1)*365+1):(i*365)] <- mpaslist[i]
+  DO_clim[((i-1)*365+1):(i*365)] <- mod$y
+}
+
+DOdata = data.frame(mpas, julianday,DO_clim)
+DOdata <- DOdata %>%
+  rename(File = mpas)
+```
+
+Merge interpolated values to MPA dataset and find SD
+
+```{r}
+#| label: inter_merge
+
+#adding julianday variable
+mpa <- mpa %>%
+  mutate(Date = make_date(Year, Month, Day)) %>%
+  mutate(julianday = yday(Date))
+
+#mpa merge to ph/do/temp
+merged <- merge(mpa, tempdata, by = c("File", "julianday"))
+merged <- merge(merged, DOdata, by = c("File", "julianday"))
+merged <- merge(merged, pHdata, by = c("File", "julianday"))
+
+#subtract climatology . clim - actual
+merged <- merged %>%
+  mutate(noclim_T = T_clim - T_surf,
+         noclim_pH = pH_clim - pH_surf,
+         noclim_DO = DO_clim - DO_surf)
+
+mpa <- mpa %>%
+  select(-Date)
+
+#find event based SD (removed clim)
+eventSD <- merged %>%
+  group_by(File) %>%
+  summarise(T_eventSD = sd(noclim_T),
+            pH_eventSD = sd(noclim_pH),
+            DO_eventSD = sd(noclim_DO))
+```
+
+## Append SD to summary stats
+
+```{r}
+#| label: append_sum
+
+#merging eventSD and seasonalSD to mpa_sum
+mpa_sum <- merge(mpa_sum, seasonalSD,  by = "File")
+mpa_sum <- merge(mpa_sum, eventSD,  by = "File")
+
+knitr::kable(head(mpa_sum))
+```
+
+## PCA
+
+PCA with all summary stats (mean, lower 10th percentile, seasonal SD, event SD)
+
+```{r}
+#| label: pca
+
+sumsub <- mpa_sum %>% select(-File,  -OBJECTID, -NAME, -Area_sq_mi, -Type, -SHORTNAME, -degx, -degy, -region) 
+
+pca <- prcomp(sumsub, scale = TRUE)
+fviz_pca_biplot(pca, repel = TRUE,
+                col.var = "black",
+                col.ind = mpa_sum$region,
+                label ="var",
+                addEllipses = TRUE)
+```
+
+## Heatmaps
+
+Create latitudinalally arranged heatmaps showing all summary stats for all MPAs
+
+```{r}
+#| label: heatmap
+
+#ordering by latitude so rows make some sense in heatmap
+selectvar <- mpa_sum[order(mpa_sum$degy),]
+
+#selecting data we want and converting first column into rownames to label rows later in the heatmap
+selectvar_norca <- selectvar %>%
+  filter(region == "norca") %>%
+  select(NAME,T_mean,T_low10, T_seasonalSD, T_eventSD, pH_mean,pH_low10, 
+         pH_seasonalSD, pH_eventSD,DO_mean,DO_low10, DO_seasonalSD, DO_eventSD)
+selectvar_centralca <- selectvar %>%
+  filter(region == "centralca") %>%
+  select(NAME,T_mean,T_low10, T_seasonalSD, T_eventSD, pH_mean,pH_low10, 
+         pH_seasonalSD, pH_eventSD,DO_mean,DO_low10, DO_seasonalSD, DO_eventSD)
+selectvar_channel <- selectvar %>%
+  filter(region == "channel") %>%
+  select(NAME,T_mean,T_low10, T_seasonalSD, T_eventSD, pH_mean,pH_low10, 
+         pH_seasonalSD, pH_eventSD,DO_mean,DO_low10, DO_seasonalSD, DO_eventSD)
+selectvar_socal <- selectvar %>%
+  filter(region == "socal") %>%
+  select(NAME,T_mean,T_low10, T_seasonalSD, T_eventSD, pH_mean,pH_low10, 
+         pH_seasonalSD, pH_eventSD,DO_mean,DO_low10, DO_seasonalSD, DO_eventSD)
+
+rnames_norca <- selectvar_norca[,1]
+rnames_centralca <- selectvar_centralca[,1]
+rnames_channel <- selectvar_channel[,1]
+rnames_socal <- selectvar_socal[,1]
+
+#heatmaps
+selectvar_norca <- as.matrix(selectvar_norca[,2:ncol(selectvar_norca)])
+rownames(selectvar_norca) <- rnames_norca
+heatmap(selectvar_norca, Rowv = NA, Colv = NA, 
+        scale="column", main = "Northern CA") 
+
+selectvar_centralca <- as.matrix(selectvar_centralca[,2:ncol(selectvar_centralca)])
+rownames(selectvar_centralca) <- rnames_centralca
+heatmap(selectvar_centralca, Rowv = NA, Colv = NA, 
+        scale="column", main = "Central CA") 
+
+selectvar_channel <- as.matrix(selectvar_channel[,2:ncol(selectvar_channel)])
+rownames(selectvar_channel) <- rnames_channel
+heatmap(selectvar_channel, Rowv = NA, Colv = NA, 
+        scale="column", main = "Channel Islands") 
+
+selectvar_socal <- as.matrix(selectvar_socal[,2:ncol(selectvar_socal)])
+rownames(selectvar_socal) <- rnames_socal
+heatmap(selectvar_socal, Rowv = NA, Colv = NA,  
+        scale="column", main = "Southern CA") 
+```
+
+## Anomalous pH/DO Event Analysis
+
+Find percentage of unsaturated/ low DO days over all years using a biological threshold. Separated by upwelling and non-upwelling months. Output is used to make maps in QGIS.
+
+```{r}
+#| label: anom
+
+#first separating mpa by upwelling/non-upwelling seasons (upwelling = april,may,june,july,aug,sept)
+mpa_up <- mpa %>%
+  filter(Month %in% c(4,5,6,7,8,9))
+mpa_nonup <-mpa %>%
+  filter(Month %in% c(1,2,3,10,11,12))
+
+
+#pH - unsaturated days for all of mpa dataset
+unsat <- mpa %>%
+  group_by(File) %>%
+  summarize(unsat_days = sum(pH_surf < 7.75, na.rm = TRUE), 
+            numdays = sum(pH_surf > 0, na.rm = TRUE)) %>%
+  mutate(prcnt_unsat = (unsat_days/numdays)*100)
+#pH - unsaturated days for only upwelling months
+unsat_up <- mpa_up %>%
+  group_by(File) %>%
+  summarize(unsat_days = sum(pH_surf < 7.75, na.rm = TRUE), 
+            numdays = sum(pH_surf > 0, na.rm = TRUE)) %>%
+  mutate(prcnt_unsat = (unsat_days/numdays)*100) 
+#pH - unsaturated days for only non-upwelling months
+unsat_nonup <- mpa_nonup %>%
+  group_by(File) %>%
+  summarize(unsat_days = sum(pH_surf < 7.75, na.rm = TRUE), 
+            numdays = sum(pH_surf > 0, na.rm = TRUE)) %>%
+  mutate(prcnt_unsat = (unsat_days/numdays)*100) 
+
+
+#DO threshod of 4.6
+hypoxic <- mpa %>%
+  group_by(File) %>%
+  summarize(hypo_days = sum(DO_mgL < 4.6, na.rm = TRUE), 
+            numdays = sum(DO_mgL > 0, na.rm = TRUE)) %>%
+  mutate(prcnt_hypo = (hypo_days/numdays)*100) 
+#DO - upwelling months
+hypoxic_up <- mpa_up %>%
+  group_by(File) %>%
+  summarize(hypo_days = sum(DO_mgL < 4.6, na.rm = TRUE), 
+            numdays = sum(DO_mgL > 0, na.rm = TRUE)) %>%
+  mutate(prcnt_hypo = (hypo_days/numdays)*100)
+#DO  -- non upwelling months
+hypoxic_nonup <- mpa_nonup %>%
+  group_by(File) %>%
+  summarize(hypo_days = sum(DO_mgL < 4.6, na.rm = TRUE), 
+            numdays = sum(DO_mgL > 0, na.rm = TRUE)) %>%
+  mutate(prcnt_hypo = (hypo_days/numdays)*100)
+
+
+#adding prcnt unsat and hypoxic to summary stats - export this into qgis to make maps
+xtremesum <- merge(mpa_sum, unsat,  by = "File")
+xtremesum_up <- merge(mpa_sum, unsat_up,  by = "File")
+xtremesum_nonup <- merge(mpa_sum, unsat_nonup,  by = "File")
+
+xtremesum <- merge(xtremesum, hypoxic,  by = "File")
+xtremesum_up <- merge(xtremesum_up, hypoxic_up,  by = "File")
+xtremesum_nonup <- merge(xtremesum_nonup, hypoxic_nonup,  by = "File")
+
+
+write.csv(xtremesum, file = "IPSLxtremesum.csv")
+write.csv(xtremesum_up, file = "IPSLxtremesum_up.csv")
+write.csv(xtremesum_nonup, file = "IPSLxtremesum_nonup.csv")
 ```
